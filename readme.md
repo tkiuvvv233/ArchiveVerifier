@@ -38,6 +38,7 @@ python ArchiveVerifier.py /scan/path \
   --exe \  # Include executable archive files
   --lang en  # Force English output \
   --output ~/ # Set the output directory for results
+  --thread 20 # Number of verification threads (default: 1)
 ```
 
 ### Example

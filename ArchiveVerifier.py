@@ -6,6 +6,8 @@ import hashlib
 import argparse
 import subprocess
 import locale
+import concurrent.futures
+import threading
 from pathlib import Path
 from collections import OrderedDict
 
@@ -29,7 +31,8 @@ LANG_DICT = {
         "argparse_7zip_help": "Path to 7z.exe (default: %(default)s)",
         "argparse_exe_help": "Include executable files in scan",
         "argparse_lang_help": "Force output language (en/zh)",
-        "argparse_output_help": "Output directory for results (default: %(default)s)"
+        "argparse_output_help": "Output directory for results (default: %(default)s)",
+        "argparse_threads_help": "Number of verification threads (default: %(default)s)"
     },
     "zh": {
         "terminating": "\n正在安全终止进程...",
@@ -49,7 +52,8 @@ LANG_DICT = {
         "argparse_7zip_help": "7z.exe 路径（默认：%(default)s）",
         "argparse_exe_help": "包含可执行文件扫描",
         "argparse_lang_help": "强制指定输出语言（zh/en）",
-        "argparse_output_help": "结果输出目录（默认：%(default)s）"
+        "argparse_output_help": "结果输出目录（默认：%(default)s）",
+        "argparse_threads_help": "验证线程数（默认：%(default)s）"
     }
 }
 
@@ -83,17 +87,22 @@ LANG = I18N()  # Initialize internationalization
 
 # Global termination flag
 exit_flag = False
-
-# Handle to current running process
-current_process = None
+# Dictionary to track processes across threads
+current_processes = {}
+# Lock for thread safety
+current_processes_lock = threading.Lock()
 
 def signal_handler(sig, frame):
     """Handle termination signals (Ctrl+C) and clean up resources"""
-    global exit_flag, current_process
+    global exit_flag
     print(LANG("terminating"))
     exit_flag = True
-    if current_process and current_process.poll() is None:
-        current_process.terminate()
+    
+    # Terminate all running processes
+    with current_processes_lock:
+        for process in list(current_processes.values()):
+            if process and process.poll() is None:
+                process.terminate()
 
 def get_dir_hash(target_dir):
     """Generate MD5 hash for directory path (first 8 characters)"""
@@ -165,36 +174,41 @@ def verify_7z_availability(seven_zip_exe):
 
 def process_file(result_file, seven_zip_exe, file_path):
     """Validate archive file integrity using 7-Zip and update results"""
-    global current_process
+    global current_processes
     if exit_flag: return
 
     print(LANG("verifying", path=file_path))
-    temp_file = f"{result_file}.tmp"
+    temp_file = f"{result_file}.tmp.{os.getpid()}.{threading.get_ident()}"
     
     try:
         # Run verification command
-        current_process = subprocess.Popen(
+        process = subprocess.Popen(
             [seven_zip_exe, "t", "-p\"\"", file_path],
             stdout=subprocess.PIPE,
             stderr=subprocess.STDOUT,
             encoding='utf-8',
             errors='replace'
         )
-        output, _ = current_process.communicate()
+        
+        # Register process in the global dictionary
+        with current_processes_lock:
+            current_processes[file_path] = process
+            
+        output, _ = process.communicate()
         
         # Parse verification results
         encrypted_keywords = {'password', 'encrypted'}
         is_encrypted = any(kw in output.lower() for kw in encrypted_keywords)
         
-        # Atomic file update
-        with open(result_file, 'r', encoding='utf-8') as f_in, \
-             open(temp_file, 'w', encoding='utf-8') as f_out:
-            
-            data = json.load(f_in, object_pairs_hook=OrderedDict)
+        # Thread-safe file update with file lock
+        with threading.Lock():
+            with open(result_file, 'r', encoding='utf-8') as f_in:
+                data = json.load(f_in, object_pairs_hook=OrderedDict)
+                
             record = data['files'].get(file_path)
             
             if record and record['result'] != 'deleted':
-                if current_process.returncode == 0:
+                if process.returncode == 0:
                     record['result'] = 'success'
                     print(LANG("verify_success", path=file_path))
                 elif is_encrypted:
@@ -208,18 +222,22 @@ def process_file(result_file, seven_zip_exe, file_path):
                 
                 data['files'][file_path] = record
             
-            json.dump(data, f_out, indent=2, ensure_ascii=False)
+            with open(temp_file, 'w', encoding='utf-8') as f_out:
+                json.dump(data, f_out, indent=2, ensure_ascii=False)
         
-        os.replace(temp_file, result_file)
+            os.replace(temp_file, result_file)
 
     except Exception as e:
         print(LANG("process_error", path=file_path, error=str(e)))
         if Path(temp_file).exists():
             os.remove(temp_file)
     finally:
-        current_process = None
+        # Clean up process entry
+        with current_processes_lock:
+            if file_path in current_processes:
+                del current_processes[file_path]
 
-def process_directory(target_dir, seven_zip_exe, check_exe, output_dir):
+def process_directory(target_dir, seven_zip_exe, check_exe, output_dir, threads=1):
     """Main processing loop for directory scanning and file verification"""
     signal.signal(signal.SIGINT, signal_handler)
     
@@ -260,12 +278,24 @@ def process_directory(target_dir, seven_zip_exe, check_exe, output_dir):
     
     verify_7z_availability(seven_zip_exe)
     
-    # Processing loop
-    for idx, file_path in enumerate(unchecked_files, 1):
-        if exit_flag: 
-            break
-        print(f"[{idx}/{total}] ", end='', flush=True)
-        process_file(result_file, seven_zip_exe, file_path)
+    # Create a thread pool for concurrent processing
+    with concurrent.futures.ThreadPoolExecutor(max_workers=threads) as executor:
+        futures = {}
+        for file_path in unchecked_files:
+            if exit_flag: 
+                break
+            future = executor.submit(process_file, result_file, seven_zip_exe, file_path)
+            futures[future] = file_path
+        
+        # Wait for all tasks to complete
+        for future in concurrent.futures.as_completed(futures):
+            if exit_flag:
+                break
+            file_path = futures[future]
+            try:
+                future.result()  # Get the result or exception
+            except Exception as e:
+                print(LANG("process_error", path=file_path, error=str(e)))
 
 def main():
     """Entry point for command-line execution"""
@@ -283,6 +313,10 @@ def main():
     parser.add_argument("-o", "--output",
                       default=".",
                       help=LANG("argparse_output_help"))
+    parser.add_argument("-t", "--threads",
+                      type=int, 
+                      default=1,
+                      help=LANG("argparse_threads_help"))
     args = parser.parse_args()
 
     if args.lang:
@@ -299,7 +333,7 @@ def main():
         print(str(e))
         return
 
-    process_directory(target_dir, args.seven_zip, args.exe, args.output)
+    process_directory(target_dir, args.seven_zip, args.exe, args.output, args.threads)
 
 if __name__ == "__main__":
     main()
